@@ -163,7 +163,7 @@ Basic usage:
 
 ```bash
 ./.venv/bin/python crawler.py \
-  --url "http://reading.sc.zzstep.com/reader/reader.aspx?id=1003244&From=Ebook&UserName=...&chapId=chap1&pId=chap1_1" \
+  --url "http://reading.sc.zzstep.com/reader/reader.aspx?id=1003244&From=Ebook&UserName=<YOUR_ACCOUNT>&token=<LONG_TOKEN>&chapId=chap1&pId=chap1_1" \
   --output ./output \
   --cookie-file ./cookies.txt \
   --all
@@ -171,7 +171,7 @@ Basic usage:
 
 - Output is organized under `output/<chapId>/` (JSON, Markdown, images) for each chapter.
 - Progress prints include the chapter id so you can tail the log for long books.
-- The crawler reuses the first page load to avoid re-solving the captcha for chapter 1, and will fetch subsequent reader pages as needed.
+- The crawler reuses the first page load to avoid re-solving the captcha for chapter 1, and will fetch subsequent reader pages as needed (all while keeping your `token`/`UserName` query parameters intact).
 - If any chapter cannot be fetched (e.g., paywalled without a valid cookie), the run logs `[error] Failed to process <chapId>` and continues with the rest.
 
 ### Paid chapters & authentication
@@ -179,10 +179,13 @@ Basic usage:
 Paid chapters return `chapStatus = -2` unless you present cookies from an account that has purchase rights. The crawler now accepts browser cookies:
 
 1. Export the cookies for `reading.sc.zzstep.com` (and `eshu.sc.zzstep.com`) from your browser in **Netscape** format; the popular [cookies.txt](https://chromewebstore.google.com/detail/cookies-txt/cclelndahbckbenkjhflekkdglbagkjg) extension works well.
-2. Run the crawler with `--cookie-file /path/to/cookies.txt` (or repeat `--cookie name=value` for ad‑hoc additions).
-3. Optional: override the HTTP user agent via `--user-agent "My UA"` if your target site is sensitive to agent strings.
+2. Copy the exact reader URL you see in the address bar when you open a paid chapter (it usually contains your `UserName` and a long `token=...` query parameter) and pass that to `--url`. Do **not** substitute placeholders here.
+3. Run the crawler with `--cookie-file /path/to/cookies.txt` (or repeat `--cookie name=value` for ad‑hoc additions).
+4. Optional: override the HTTP user agent via `--user-agent "My UA"` if your target site is sensitive to agent strings.
 
 Cookies from the supplied file are reused for both the initial `requests` session and the Playwright browser context, so any authenticated resources (full chapters, protected images) are fetched with the same privileges as your browser session.
+
+> ⚠️ In older iterations of this project we bundled a static `getChapCore.js` that always reported `chapStatus = 1`. The crawler now evaluates the **live** inline script straight from the reader page, so paid chapters will return `chapStatus = -2` unless your cookies and query parameters match a fully authorized session.
 
 What you get:
 - Default run (single chapter): `output/chapter.json`, `output/chapter.md`, and `output/images/`.
