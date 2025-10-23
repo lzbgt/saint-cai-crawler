@@ -35,6 +35,78 @@ from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def load_cookies_from_file(path: Path) -> requests.cookies.RequestsCookieJar:
+    jar = requests.cookies.RequestsCookieJar()
+    if not path.exists():
+        raise FileNotFoundError(f"Cookie file not found: {path}")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        domain, flag, path_value, secure_flag, expiry, name, value = parts
+        if domain.startswith("#HttpOnly_"):
+            domain = domain[len("#HttpOnly_") :]
+        secure = secure_flag.upper() == "TRUE"
+        expires = None
+        if expiry and expiry.isdigit():
+            try:
+                expires = int(expiry)
+            except ValueError:
+                expires = None
+        cookie = requests.cookies.create_cookie(
+            domain=domain,
+            name=name,
+            value=value,
+            path=path_value or "/",
+            secure=secure,
+            expires=expires,
+        )
+        jar.set_cookie(cookie)
+    return jar
+
+
+def parse_inline_cookie(cookie_str: str) -> Tuple[str, str]:
+    if "=" not in cookie_str:
+        raise ValueError(f"Cookie must be in name=value format: {cookie_str}")
+    name, value = cookie_str.split("=", 1)
+    return name.strip(), value.strip()
+
+
+def jar_to_playwright_cookies(
+    jar: requests.cookies.RequestsCookieJar,
+) -> List[Dict[str, Any]]:
+    cookies: List[Dict[str, Any]] = []
+    for cookie in jar:
+        domain = cookie.domain or ""
+        if domain.startswith("."):
+            domain_value = domain
+        elif domain:
+            domain_value = domain
+        else:
+            continue
+        cookie_dict: Dict[str, Any] = {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": domain_value,
+            "path": cookie.path or "/",
+        }
+        if cookie.expires:
+            cookie_dict["expires"] = cookie.expires
+        if cookie.secure is not None:
+            cookie_dict["secure"] = bool(cookie.secure)
+        cookies.append(cookie_dict)
+    return cookies
+
+
 NODE_BRIDGE = r"""
 const {JSDOM} = require('jsdom');
 const jqueryFactory = require('jquery');
@@ -118,8 +190,8 @@ main().catch(err => {
 """
 
 
-def fetch_page(url: str) -> BeautifulSoup:
-    resp = requests.get(url)
+def fetch_page(url: str, session: requests.Session) -> BeautifulSoup:
+    resp = session.get(url)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
@@ -776,7 +848,11 @@ def build_chapter_structure(
 
 
 def download_images_via_browser(
-    page_url: str, image_urls: Iterable[str], dest_dir: Path
+    page_url: str,
+    image_urls: Iterable[str],
+    dest_dir: Path,
+    cookies: Optional[List[Dict[str, Any]]] = None,
+    user_agent: Optional[str] = None,
 ) -> Dict[str, str]:
     """Use Playwright/Chromium to fetch protected images behind the WAF."""
     urls = list(image_urls)
@@ -797,7 +873,15 @@ def download_images_via_browser(
     async def _run() -> Dict[str, str]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
+            context_kwargs: Dict[str, Any] = {}
+            if user_agent:
+                context_kwargs["user_agent"] = user_agent
+            context = await browser.new_context(**context_kwargs)
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[warn] failed to preload cookies: {exc}", file=sys.stderr)
             page = await context.new_page()
             await page.goto(page_url, wait_until="networkidle")
 
@@ -820,6 +904,7 @@ def download_images_via_browser(
 
                 mapping[url] = filename
 
+            await context.close()
             await browser.close()
 
         return mapping
@@ -828,13 +913,16 @@ def download_images_via_browser(
 
 
 def download_images_via_requests(
-    image_urls: Iterable[str], dest_dir: Path
+    image_urls: Iterable[str],
+    dest_dir: Path,
+    session: Optional[requests.Session] = None,
 ) -> Dict[str, str]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     mapping: Dict[str, str] = {}
+    client = session or requests.Session()
     for idx, url in enumerate(image_urls, start=1):
         try:
-            resp = requests.get(url, stream=True, timeout=15)
+            resp = client.get(url, stream=True, timeout=15)
             resp.raise_for_status()
         except requests.RequestException as exc:
             print(f"[warn] failed to download {url}: {exc}", file=sys.stderr)
@@ -1251,9 +1339,11 @@ def render_markdown(chapter: Dict[str, Any], url_to_file: Dict[str, str]) -> str
 def process_chapter(
     chapter_url: str,
     output_dir: Path,
+    session: requests.Session,
+    user_agent: Optional[str],
     preloaded_page: Optional[BeautifulSoup] = None,
 ) -> Dict[str, Any]:
-    reader_page = preloaded_page or fetch_page(chapter_url)
+    reader_page = preloaded_page or fetch_page(chapter_url, session)
     chap_id = reader_page.find("input", {"id": "hiddenChapId"})["value"]
     chapter_html = decrypt_chapter(
         reader_page,
@@ -1263,13 +1353,20 @@ def process_chapter(
     chapter_structure["images"] = image_urls
 
     image_map: Dict[str, str] = {}
+    browser_cookies = jar_to_playwright_cookies(session.cookies)
     try:
         image_map = download_images_via_browser(
-            chapter_url, image_urls, output_dir / "images"
+            chapter_url,
+            image_urls,
+            output_dir / "images",
+            cookies=browser_cookies,
+            user_agent=user_agent,
         )
     except RuntimeError as exc:
         print(f"[warn] {exc}", file=sys.stderr)
-        image_map = download_images_via_requests(image_urls, output_dir / "images")
+        image_map = download_images_via_requests(
+            image_urls, output_dir / "images", session=session
+        )
 
     enrich_images(chapter_structure, image_map)
     finalize_qa_items(chapter_structure)
@@ -1315,6 +1412,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Download the entire book by following the catalog (ignores --max-chapters).",
     )
+    parser.add_argument(
+        "--cookie",
+        action="append",
+        default=[],
+        help="Cookie in name=value format (can be repeated).",
+    )
+    parser.add_argument(
+        "--cookie-file",
+        help="Path to a Netscape cookies.txt file exported from your browser.",
+    )
+    parser.add_argument(
+        "--user-agent",
+        help="Override the default User-Agent string for HTTP requests and Playwright.",
+    )
     return parser.parse_args()
 
 
@@ -1322,7 +1433,26 @@ def main() -> None:
     args = parse_args()
     base_output_dir = Path(args.output)
 
-    first_page = fetch_page(args.url)
+    session = requests.Session()
+    user_agent = args.user_agent or DEFAULT_USER_AGENT
+    session.headers.update({"User-Agent": user_agent})
+
+    initial_jar = requests.cookies.RequestsCookieJar()
+    if args.cookie_file:
+        initial_jar.update(load_cookies_from_file(Path(args.cookie_file)))
+    for raw_cookie in args.cookie:
+        name, value = parse_inline_cookie(raw_cookie)
+        cookie = requests.cookies.create_cookie(
+            domain=".sc.zzstep.com",
+            name=name,
+            value=value,
+            path="/",
+        )
+        initial_jar.set_cookie(cookie)
+    if initial_jar:
+        session.cookies.update(initial_jar)
+
+    first_page = fetch_page(args.url, session)
 
     chapters_meta = extract_chapter_sequence(first_page)
     initial_chap_id = first_page.find("input", {"id": "hiddenChapId"})["value"]
@@ -1412,13 +1542,15 @@ def main() -> None:
     for entry in planned[:max_to_process]:
         chapter_url = entry["url"]
         preloaded = entry["page"]
-        reader_page = preloaded or fetch_page(chapter_url)
+        reader_page = preloaded or fetch_page(chapter_url, session)
         chap_id = reader_page.find("input", {"id": "hiddenChapId"})["value"]
         output_dir = base_output_dir / chap_id if multi_output else base_output_dir
         try:
             chapter_result = process_chapter(
                 chapter_url,
                 output_dir=output_dir,
+                session=session,
+                user_agent=user_agent,
                 preloaded_page=reader_page,
             )
         except RuntimeError as exc:
