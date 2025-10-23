@@ -57,7 +57,7 @@ def load_cookies_from_file(path: Path) -> requests.cookies.RequestsCookieJar:
             domain = domain[len("#HttpOnly_") :]
         secure = secure_flag.upper() == "TRUE"
         expires = None
-        if expiry and expiry.isdigit():
+        if expiry and expiry != "0" and expiry.isdigit():
             try:
                 expires = int(expiry)
             except ValueError:
