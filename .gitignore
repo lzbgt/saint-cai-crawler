@@ -1,0 +1,7 @@
+.vscode/
+.venv/
+node_modules/
+*.html
+*.png
+__pycache__/
+
